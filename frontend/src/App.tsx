@@ -4,188 +4,175 @@ const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
 
 function App() {
   const [t4File, setT4File] = useState<File | null>(null);
-  const [extractResult, setExtractResult] = useState<string>("");
-  const [extractError, setExtractError] = useState<string>("");
+  const [error, setError] = useState<string>("");
+  const [status, setStatus] = useState<string>("");
+  const [notification, setNotification] = useState<string>("");
+  const [isProcessing, setIsProcessing] = useState<boolean>(false);
 
-  const [mapInput, setMapInput] = useState<string>("");
-  const [mapResult, setMapResult] = useState<string>("");
-  const [mapError, setMapError] = useState<string>("");
-
-  const [fillInput, setFillInput] = useState<string>("");
-  const [fillError, setFillError] = useState<string>("");
-
-  const [processFile, setProcessFile] = useState<File | null>(null);
-  const [processError, setProcessError] = useState<string>("");
-
-  const handleExtract = async () => {
-    if (!t4File) {
-      setExtractError("Please choose a T4 PDF first.");
-      return;
-    }
-    setExtractError("");
-    try {
-      const form = new FormData();
-      form.append("file", t4File);
-      const response = await fetch(`${API_BASE}/api/extract`, {
-        method: "POST",
-        body: form,
-      });
-      if (!response.ok) {
-        const detail = await response.json().catch(() => ({}));
-        throw new Error(detail?.error ?? response.statusText);
-      }
-      const json = await response.json();
-      const pretty = JSON.stringify(json, null, 2);
-      setExtractResult(pretty);
-      setMapInput(pretty);
-    } catch (err) {
-      setExtractError(err instanceof Error ? err.message : "Extraction failed");
-    }
+  const resetMessages = () => {
+    setError("");
+    setStatus("");
+    setNotification("");
   };
 
-  const handleMap = async () => {
-    setMapError("");
-    try {
-      const response = await fetch(`${API_BASE}/api/map`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: mapInput,
-      });
-      if (!response.ok) {
-        const detail = await response.json().catch(() => ({}));
-        throw new Error(detail?.error ?? response.statusText);
-      }
-      const json = await response.json();
-      const pretty = JSON.stringify(json, null, 2);
-      setMapResult(pretty);
-      const byField = JSON.stringify(json?.byField ?? {}, null, 2);
-      setFillInput(byField);
-    } catch (err) {
-      setMapError(err instanceof Error ? err.message : "Mapping failed");
-    }
-  };
-
-  const handleFill = async () => {
-    setFillError("");
-    try {
-      const response = await fetch(`${API_BASE}/api/fill`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ byField: JSON.parse(fillInput || "{}") }),
-      });
-      if (!response.ok) {
-        const detail = await response.json().catch(() => ({}));
-        throw new Error(detail?.error ?? response.statusText);
-      }
-      if (response.headers.get("content-type")?.includes("application/json")) {
-        const json = await response.json();
-        if (json?.url) {
-          window.open(json.url, "_blank");
-          return;
-        }
-      }
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = "Completed-T1.pdf";
-      link.click();
-      URL.revokeObjectURL(url);
-    } catch (err) {
-      setFillError(err instanceof Error ? err.message : "Fill failed");
-    }
+  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    resetMessages();
+    const file = event.target.files?.[0] ?? null;
+    setT4File(file);
   };
 
   const handleProcess = async () => {
-    if (!processFile) {
-      setProcessError("Please choose a T4 PDF first.");
+    if (!t4File) {
+      setError("Please choose a T4 PDF before processing.");
       return;
     }
-    setProcessError("");
+
+    setError("");
+    setNotification("");
+    setStatus("Uploading T4 slip…");
+    setIsProcessing(true);
+
     try {
       const form = new FormData();
-      form.append("file", processFile);
+      form.append("file", t4File);
+
       const response = await fetch(`${API_BASE}/api/process`, {
         method: "POST",
         body: form,
       });
+
       if (!response.ok) {
         const detail = await response.json().catch(() => ({}));
         throw new Error(detail?.error ?? response.statusText);
       }
+
+      setStatus("Generating your completed T1…");
+
       if (response.headers.get("content-type")?.includes("application/json")) {
         const json = await response.json();
         if (json?.url) {
           window.open(json.url, "_blank");
+          setNotification("Your completed T1 has been generated. It opened in a new tab.");
+          setStatus("");
           return;
         }
       }
+
+      setStatus("Preparing download…");
       const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
+      const downloadUrl = URL.createObjectURL(blob);
       const link = document.createElement("a");
-      link.href = url;
+      link.href = downloadUrl;
       link.download = "Completed-T1.pdf";
+      document.body.appendChild(link);
       link.click();
-      URL.revokeObjectURL(url);
+      link.remove();
+      URL.revokeObjectURL(downloadUrl);
+      setNotification("Your completed T1 has been downloaded.");
+      setStatus("");
     } catch (err) {
-      setProcessError(err instanceof Error ? err.message : "Process failed");
+      setStatus("");
+      setError(err instanceof Error ? err.message : "Processing failed");
+    } finally {
+      setIsProcessing(false);
     }
   };
 
   return (
-    <main style={{ fontFamily: "sans-serif", maxWidth: 960, margin: "0 auto", padding: "2rem" }}>
-      <h1>Tax Codex – CRA 2024 Ontario</h1>
+    <main
+      style={{
+        fontFamily: "Inter, system-ui, sans-serif",
+        maxWidth: 720,
+        margin: "0 auto",
+        padding: "3rem 1.5rem",
+      }}
+    >
+      <header style={{ marginBottom: "2.5rem" }}>
+        <h1 style={{ fontSize: "2.5rem", marginBottom: "0.5rem" }}>AI T1 Filing Assistant</h1>
+        <p style={{ color: "#555", margin: 0 }}>
+          Upload a T4 slip and we will automatically produce a filled CRA T1 return.
+        </p>
+      </header>
 
-      <section style={{ marginBottom: "2rem" }}>
-        <h2>1. Extract</h2>
-        <input type="file" accept="application/pdf" onChange={(e) => setT4File(e.target.files?.[0] ?? null)} />
-        <button onClick={handleExtract} style={{ marginLeft: "1rem" }}>Extract T4</button>
-        {extractError && <p style={{ color: "red" }}>{extractError}</p>}
-        {extractResult && (
-          <details open>
-            <summary>Extracted JSON</summary>
-            <pre>{extractResult}</pre>
-          </details>
+      <section
+        style={{
+          background: "#f7f8fa",
+          borderRadius: "12px",
+          padding: "2rem",
+          boxShadow: "0 1px 3px rgba(15, 23, 42, 0.08)",
+        }}
+      >
+        <h2 style={{ fontSize: "1.5rem", marginBottom: "1rem" }}>Process T4 → T1</h2>
+        <p style={{ color: "#444", marginBottom: "1.5rem" }}>
+          Select a T4 PDF file, then click <strong>Process T4</strong>. We will extract the data,
+          map it to the correct CRA lines, fill the T1 form, and download the completed return.
+        </p>
+
+        <div style={{ display: "flex", gap: "1rem", alignItems: "center", marginBottom: "1.5rem" }}>
+          <input
+            type="file"
+            accept="application/pdf"
+            onChange={handleFileChange}
+            disabled={isProcessing}
+          />
+          <button
+            onClick={handleProcess}
+            disabled={isProcessing}
+            style={{
+              backgroundColor: isProcessing ? "#cbd5f5" : "#3b82f6",
+              color: "white",
+              border: "none",
+              borderRadius: "999px",
+              padding: "0.75rem 1.75rem",
+              fontSize: "1rem",
+              cursor: isProcessing ? "not-allowed" : "pointer",
+              transition: "background-color 0.2s ease",
+            }}
+          >
+            {isProcessing ? "Processing…" : "Process T4"}
+          </button>
+        </div>
+
+        {status && (
+          <div
+            style={{
+              background: "#e0f2fe",
+              color: "#0369a1",
+              padding: "0.75rem 1rem",
+              borderRadius: "8px",
+              marginBottom: "1rem",
+            }}
+          >
+            {status}
+          </div>
         )}
-      </section>
 
-      <section style={{ marginBottom: "2rem" }}>
-        <h2>2. Map</h2>
-        <textarea
-          value={mapInput}
-          onChange={(e) => setMapInput(e.target.value)}
-          rows={12}
-          style={{ width: "100%" }}
-          placeholder="Paste normalized JSON here"
-        />
-        <button onClick={handleMap}>Map to T1</button>
-        {mapError && <p style={{ color: "red" }}>{mapError}</p>}
-        {mapResult && (
-          <details open>
-            <summary>Mapped Output</summary>
-            <pre>{mapResult}</pre>
-          </details>
+        {notification && (
+          <div
+            style={{
+              background: "#dcfce7",
+              color: "#166534",
+              padding: "0.75rem 1rem",
+              borderRadius: "8px",
+              marginBottom: "1rem",
+            }}
+          >
+            {notification}
+          </div>
         )}
-      </section>
 
-      <section style={{ marginBottom: "2rem" }}>
-        <h2>3. Fill</h2>
-        <textarea
-          value={fillInput}
-          onChange={(e) => setFillInput(e.target.value)}
-          rows={8}
-          style={{ width: "100%" }}
-          placeholder="Paste byField JSON here"
-        />
-        <button onClick={handleFill}>Fill T1 PDF</button>
-        {fillError && <p style={{ color: "red" }}>{fillError}</p>}
-      </section>
-
-      <section>
-        <h2>4. Process (Extract + Map + Fill)</h2>
-        <input type="file" accept="application/pdf" onChange={(e) => setProcessFile(e.target.files?.[0] ?? null)} />
-        <button onClick={handleProcess} style={{ marginLeft: "1rem" }}>Process T4</button>
-        {processError && <p style={{ color: "red" }}>{processError}</p>}
+        {error && (
+          <div
+            style={{
+              background: "#fee2e2",
+              color: "#b91c1c",
+              padding: "0.75rem 1rem",
+              borderRadius: "8px",
+            }}
+          >
+            {error}
+          </div>
+        )}
       </section>
     </main>
   );
