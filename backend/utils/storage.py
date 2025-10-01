@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
 import os
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 try:
     from azure.storage.blob import BlobClient, ContentSettings
@@ -36,6 +39,7 @@ def get_t1_template_bytes() -> bytes:
     try:
         downloader = client.download_blob()
         data = downloader.readall()
+        logger.info("Downloaded template blob %s/%s (%d bytes)", container, blob_name, len(data) if data else 0)
     except Exception as exc:
         raise StorageError(f"Failed to download blob '{blob_name}' from container '{container}'") from exc
 
@@ -66,6 +70,7 @@ def upload_completed_t1(pdf_bytes: bytes, out_blob_name: str) -> str:
             overwrite=True,
             content_settings=ContentSettings(content_type="application/pdf"),
         )
+        logger.info("Uploaded filled PDF to %s/%s (%d bytes)", target_container, out_blob_name, len(pdf_bytes))
     except Exception as exc:
         raise StorageError(
             f"Failed to upload blob '{out_blob_name}' to container '{target_container}'"

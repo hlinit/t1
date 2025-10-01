@@ -22,6 +22,11 @@ from .routes.storage_debug import router as storage_router
 from .utils.storage import StorageError, get_t1_template_bytes, upload_completed_t1
 from .utils.t1_fields import get_t1_field_names
 from .utils.fill_t1 import fill_t1_pdf
+from .utils.t4_extract import (
+    T4ExtractionError,
+    extract_t4_identity,
+    extract_t4_identity_fields,
+)
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -92,6 +97,7 @@ class Settings(BaseModel):
     azure_search_top_n: int = Field(default=5, alias="AZURE_SEARCH_TOP_N")
     azure_search_strictness: int = Field(default=3, alias="AZURE_SEARCH_STRICTNESS")
     azure_search_filter: Optional[str] = Field(default=None, alias="AZURE_SEARCH_FILTER")
+    ssl_verify: Optional[str] = Field(default=None, alias="SSL_VERIFY")
 
     cors_allow_origins: str = Field(default="*", alias="CORS_ALLOW_ORIGINS")
 
@@ -191,7 +197,18 @@ async def _call_azure_openai(
         "api-key": settings.azure_openai_key,
     }
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    verify: Union[bool, str] = True
+    if settings.ssl_verify is not None:
+        raw = settings.ssl_verify.strip()
+        if not raw:
+            verify = True
+        elif raw.lower() in {"false", "0", "no", "off"}:
+            verify = False
+            logger.warning("SSL verification disabled for Azure OpenAI requests")
+        else:
+            verify = raw
+
+    async with httpx.AsyncClient(timeout=60.0, verify=verify) as client:
         response = await client.post(url, headers=headers, json=payload)
 
     if response.status_code != 200:
@@ -269,6 +286,59 @@ def _coerce_json_dict(raw: str) -> Dict[str, Any]:
 
     raise ValueError('Response did not contain valid JSON object')
 
+
+
+def _augment_by_field_from_lines(by_line: Dict[str, float], field_names: List[str], existing: Dict[str, Union[float, str]]) -> Dict[str, Union[float, str]]:
+    result: Dict[str, Union[float, str]] = {
+        _canonical_field_name(name): val
+        for name, val in existing.items()
+        if val is not None
+    }
+    if not by_line:
+        return result
+
+    normalized = [
+        (name, name.lower(), _canonical_field_name(name))
+        for name in field_names
+    ]
+
+    for line_label, value in by_line.items():
+        if value is None:
+            continue
+        digits = ''.join(ch for ch in line_label if ch.isdigit())
+        if not digits:
+            continue
+        best_entry = None
+        best_score = -1.0
+        needle_exact = f"line_{digits}"
+        for original, lowered, canonical in normalized:
+            if digits not in lowered:
+                continue
+            score = 0.0
+            if needle_exact in lowered:
+                score += 2.0
+            if 'amount' in lowered:
+                score += 1.0
+            if lowered.endswith('[0]'):
+                score += 0.1
+            if score > best_score:
+                best_score = score
+                best_entry = (original, lowered, canonical)
+        if best_entry is None:
+            continue
+        canonical_name = best_entry[2]
+        if canonical_name not in result:
+            result[canonical_name] = value
+    return result
+
+
+
+def _canonical_field_name(name: str) -> str:
+    if not name:
+        return name
+    if '.' in name:
+        name = name.split('.')[-1]
+    return name
 
 STRING_BOXES = {"10", "12", "54"}
 NUMERIC_STRIP_RE = re.compile(r"[^0-9.+-]")
@@ -401,6 +471,38 @@ async def _extract_payload(pdf_bytes: bytes) -> ExtractedPayload:
         raise HTTPException(status_code=400, detail={"error": "Uploaded file is empty"})
 
     raw_values = _read_form_values(pdf_bytes)
+    identity_payload: Optional[NormalizedIdentity] = None
+    try:
+        t4_identity = extract_t4_identity(pdf_bytes)
+    except T4ExtractionError:
+        pass
+    except Exception as exc:
+        logger.warning("Unexpected error extracting T4 identity: %s", exc)
+    else:
+        sin_value = None
+        if t4_identity.sin:
+            digits = re.sub(r'\D', '', t4_identity.sin)
+            sin_value = digits or t4_identity.sin.strip()
+        address_parts = []
+        if t4_identity.street:
+            address_parts.append(t4_identity.street)
+        locality_parts = [part for part in (t4_identity.city, t4_identity.province) if part]
+        locality = ", ".join(locality_parts) if locality_parts else ''
+        postal = t4_identity.postal_code or ''
+        if postal:
+            locality = f'{locality} {postal}'.strip() if locality else postal
+        if locality:
+            address_parts.append(locality)
+        address_value = ", ".join(address_parts) or None
+        identity_payload = NormalizedIdentity(
+            firstName=t4_identity.first_name,
+            lastName=t4_identity.last_name,
+            initial=t4_identity.initial,
+            sin=sin_value,
+            address=address_value,
+        )
+        if not identity_payload.model_dump(exclude_none=True):
+            identity_payload = None
     boxes: Dict[str, Union[float, str]] = {}
     other_codes: Dict[str, str] = {}
     other_amounts: Dict[str, float] = {}
@@ -447,13 +549,19 @@ async def _extract_payload(pdf_bytes: bytes) -> ExtractedPayload:
             continue
         other_info[code] = amount
 
-    payload = ExtractedPayload(year="2024", boxes=boxes, otherInfo=other_info)
+    payload = ExtractedPayload(
+        year="2024",
+        boxes=boxes,
+        otherInfo=other_info,
+        identity=identity_payload,
+    )
     return payload
 
 
 def _to_normalized_payload(extracted: ExtractedPayload) -> NormalizedPayload:
+    identity = extracted.identity.model_copy() if extracted.identity else NormalizedIdentity()
     return NormalizedPayload(
-        identity=NormalizedIdentity(),
+        identity=identity,
         boxes=dict(extracted.boxes),
         otherInfo=dict(extracted.otherInfo),
     )
@@ -461,6 +569,7 @@ def _to_normalized_payload(extracted: ExtractedPayload) -> NormalizedPayload:
 
 async def _map_payload(payload: NormalizedPayload, settings: Settings, field_names: List[str]) -> MapResult:
     sample_field = field_names[0] if field_names else "T1_FIELD_NAME"
+    canonical_field_names = {_canonical_field_name(name) for name in field_names}
     example_output = {
         "byLine": {"Line 10100": 12345.67},
         "byField": {sample_field: "Example value"},
@@ -511,8 +620,15 @@ Rules:
         logger.error("Mapping output validation failed: %s", exc)
         raise HTTPException(status_code=422, detail={"error": "Mapping output invalid"}) from exc
 
-    filtered_fields = {k: result.byField[k] for k in result.byField if k in field_names}
-    return MapResult(byLine=result.byLine, byField=filtered_fields)
+    filtered_fields: Dict[str, Union[float, str]] = {}
+    for key, value in result.byField.items():
+        canonical_key = _canonical_field_name(key)
+        if canonical_key not in canonical_field_names:
+            continue
+        if value is not None:
+            filtered_fields[canonical_key] = value
+    augmented_fields = _augment_by_field_from_lines(result.byLine, field_names, filtered_fields)
+    return MapResult(byLine=result.byLine, byField=augmented_fields)
 
 app = FastAPI(title="Tax Codex CRA Ontario 2024 API", version="0.2.0")
 
@@ -584,13 +700,64 @@ async def fill_endpoint(body: FillInput):
         logger.error("Failed to read T1 template: %s", exc)
         raise HTTPException(status_code=500, detail={"error": "Unable to read T1 template"}) from exc
 
+    by_field = {_canonical_field_name(k): v for k, v in body.byField.items()}
+    if body.byLine:
+        field_names: List[str] = []
+        try:
+            field_names = get_t1_field_names(template_bytes)
+        except Exception as exc:
+            logger.warning("Failed to read T1 field names for fill: %s", exc)
+        if field_names:
+            by_field = _augment_by_field_from_lines(body.byLine, field_names, by_field)
+
     try:
-        pdf_bytes = fill_t1_pdf(template_bytes, body.byField)
+        pdf_bytes = fill_t1_pdf(template_bytes, by_field)
     except Exception as exc:
-        logger.error("Failed to fill T1 PDF: %s", exc)
-        raise HTTPException(status_code=500, detail={"error": "Failed to fill T1 PDF"}) from exc
+        logger.error("Failed to fill T1 PDF: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={"error": f"Failed to fill T1 PDF: {exc}"},
+        ) from exc
 
     return _pdf_response(pdf_bytes)
+
+
+
+@app.post("/api/fill-from-t4")
+async def fill_from_t4(file: UploadFile = File(...)):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail={"error": "File name is required"})
+    if not file.content_type or "pdf" not in file.content_type.lower():
+        raise HTTPException(status_code=400, detail={"error": "Only PDF files are supported"})
+
+    t4_bytes = await file.read()
+    if not t4_bytes:
+        raise HTTPException(status_code=400, detail={"error": "Uploaded file is empty"})
+
+    try:
+        field_mapping = extract_t4_identity_fields(t4_bytes)
+    except T4ExtractionError as exc:
+        raise HTTPException(status_code=422, detail={"error": str(exc)}) from exc
+    except Exception as exc:
+        logger.error("Failed to parse T4 PDF: %s", exc, exc_info=True)
+        raise HTTPException(status_code=400, detail={"error": "Unable to read T4 PDF"}) from exc
+
+    try:
+        template_bytes = _load_t1_template()
+    except StorageError as exc:
+        logger.error("Failed to load T1 template from storage: %s", exc)
+        raise HTTPException(status_code=500, detail={"error": "Unable to load T1 template"}) from exc
+    except Exception as exc:
+        logger.error("Failed to read T1 template: %s", exc)
+        raise HTTPException(status_code=500, detail={"error": "Unable to read T1 template"}) from exc
+
+    try:
+        filled_pdf = fill_t1_pdf(template_bytes, field_mapping)
+    except Exception as exc:
+        logger.error("Failed to fill T1 PDF from T4: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail={"error": "Failed to fill T1 PDF"}) from exc
+
+    return _pdf_response(filled_pdf)
 
 @app.post("/api/process")
 async def process_endpoint(file: UploadFile = File(...)):
@@ -616,10 +783,26 @@ async def process_endpoint(file: UploadFile = File(...)):
 
     normalized_input = _to_normalized_payload(extracted)
     mapped = await _map_payload(normalized_input, settings, field_names)
+
+    combined_fields = dict(mapped.byField)
     try:
-        filled_pdf = fill_t1_pdf(template_bytes, mapped.byField)
+        identity_fields = extract_t4_identity_fields(pdf_bytes)
+        identity_fields = {_canonical_field_name(k): v for k, v in identity_fields.items()}
+    except T4ExtractionError:
+        identity_fields = {}
     except Exception as exc:
-        logger.error("Failed to fill T1 PDF: %s", exc)
+        identity_fields = {}
+        logger.warning("Unable to derive identity fields from T4 for process endpoint: %s", exc)
+    for key, value in identity_fields.items():
+        if value is None:
+            continue
+        if key not in combined_fields or combined_fields[key] in (None, ''):
+            combined_fields[key] = value
+
+    try:
+        filled_pdf = fill_t1_pdf(template_bytes, combined_fields)
+    except Exception as exc:
+        logger.error("Failed to fill T1 PDF: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail={"error": "Failed to fill T1 PDF"}) from exc
 
     return _pdf_response(filled_pdf)
@@ -643,6 +826,7 @@ def storage_debug() -> Dict[str, Any]:
 @app.get("/health")
 async def health_check() -> Dict[str, str]:
     return {"status": "ok"}
+
 
 
 

@@ -31,6 +31,7 @@ class ExtractedPayload(BaseModel):
     year: str
     boxes: Dict[str, Union[float, str]]
     otherInfo: Dict[str, float]
+    identity: Optional[NormalizedIdentity] = None
 
 
 class MapResult(BaseModel):
@@ -40,3 +41,4 @@ class MapResult(BaseModel):
 
 class FillInput(BaseModel):
     byField: Dict[str, Union[float, int, str]]
+    byLine: Optional[Dict[str, float]] = None

@@ -5,6 +5,7 @@ from typing import Mapping, Union
 
 try:
     from pypdf import PdfReader, PdfWriter
+    from pypdf.generic import ArrayObject, BooleanObject, DictionaryObject, IndirectObject, NameObject
 except ImportError as exc:  # pragma: no cover - optional dependency
     raise ImportError("pypdf is required to fill T1 PDFs") from exc
 
@@ -20,14 +21,37 @@ def fill_t1_pdf(template_bytes: bytes, by_field: Mapping[str, PdfValue]) -> byte
 
     reader = PdfReader(io.BytesIO(template_bytes))
     writer = PdfWriter()
+    writer.clone_reader_document_root(reader)
     for page in reader.pages:
         writer.add_page(page)
 
-    # Ensure form values remain visible across viewers by setting NeedAppearances.
-    writer._root_object.setdefault("/AcroForm", reader.trailer["/Root"].get("/AcroForm", {}))
-    acro_form = writer._root_object.get("/AcroForm")
-    if acro_form is not None:
-        acro_form["/NeedAppearances"] = True
+    root = writer._root_object
+    acro_form_obj = root.get(NameObject("/AcroForm"))
+    if isinstance(acro_form_obj, IndirectObject):
+        acro_form = acro_form_obj.get_object()  # unwrap
+    elif acro_form_obj is None:
+        existing_acro = reader.trailer.get("/Root", {}).get("/AcroForm")
+        acro_form = existing_acro.get_object() if isinstance(existing_acro, IndirectObject) else existing_acro
+        if acro_form is None:
+            acro_form = DictionaryObject()
+        root[NameObject("/AcroForm")] = acro_form
+    else:
+        acro_form = acro_form_obj
+
+    fields_array = acro_form.get(NameObject("/Fields"))
+    if fields_array is None:
+        existing_fields = reader.trailer.get("/Root", {}).get("/AcroForm", {}).get("/Fields")
+        if existing_fields is None:
+            raise ValueError("Template PDF does not contain form fields.")
+        if isinstance(existing_fields, IndirectObject):
+            fields_array = existing_fields.get_object()
+        else:
+            fields_array = existing_fields
+        if not isinstance(fields_array, ArrayObject):
+            raise ValueError("AcroForm fields dictionary is malformed.")
+        acro_form[NameObject("/Fields")] = fields_array
+
+    acro_form[NameObject("/NeedAppearances")] = BooleanObject(True)
 
     stringified = {name: str(value) for name, value in by_field.items() if value is not None}
 
